@@ -1,137 +1,75 @@
-# Blank agent template guide
+# Sentry — guide for agents working on this repo
 
-This generated project composes a protocol-neutral agent runtime with the HTTP
-extension and optional x402 payments. The selected adapter only mounts the
-completed HTTP runtime; it does not own a second registry or paywall.
+Liquidation-defence agent on Lucid Agents. Watches an Aave V3 position, repays
+debt through KeeperHub before liquidation, verifies the result on-chain.
+
+## Where things are
+
+| path | what |
+|---|---|
+| `src/lib/loop.ts` | **the agent** — read → decide → execute → verify. Start here. |
+| `src/lib/agent.ts` | entrypoints (`health`, `watch`, `defend`, `journal`) and the poll timer |
+| `src/keeperhub/` | the execution extension; also published as `Makabeez/keeperhub-lucid` |
+| `test/` | 27 tests, no network required |
+| `evidence/EVIDENCE.md` | every on-chain transaction, including the failures |
 
 ## Runtime composition
 
-The generated agent follows this shape:
-
-```ts
-import { createAgent } from '@lucid-agents/core';
-import { http } from '@lucid-agents/http';
-import { payments, paymentsFromEnv } from '@lucid-agents/payments';
-
-const agent = await createAgent({
-  name: process.env.AGENT_NAME ?? 'my-agent',
-  version: process.env.AGENT_VERSION ?? '0.1.0',
-  description: process.env.AGENT_DESCRIPTION,
-})
-  .use(payments({ config: paymentsFromEnv() }))
-  .use(http({ basePath: '/api/agent' })) // generated only when the adapter needs it
-  .build();
-```
-
-`paymentsFromEnv()` returns `undefined` when payment configuration is absent,
-so a free generated agent can boot without payment variables. A priced
-entrypoint activates payments and fails closed unless the required destination,
-network, and facilitator configuration is complete.
-
-Register entrypoints through the adapter's returned `addEntrypoint` helper or
-`runtime.entrypoints.add`. Both write to the same canonical registry:
-
-```ts
-addEntrypoint({
-  key: 'echo',
-  input: z.object({ text: z.string().min(1) }),
-  output: z.object({ text: z.string() }),
-  handler: async ({ input }) => ({ output: { text: input.text } }),
-});
-```
-
-Add `price: '0.01'` for x402. Add a `stream` handler to support SSE; there is no
-separate streaming flag.
-
-## Adapter shapes
-
-- Hono and Express call `createAgentApp(agent)` and bind
-  `agent.http.routes`.
-- TanStack calls `createTanStackRuntime(agent)` and exports its handlers.
-- Next exports `agent.http.handlers` through route modules.
-- TanStack and Next use `/api/agent` as the HTTP base path; Hono and Express use
-  the root unless changed in `http({ basePath })`.
-
-Every route, including discovery and tasks, uses the configured base path. The
-canonical card is `/.well-known/agent-card.json` below that path. Generated
-framework-root compatibility routes delegate to the same manifest handler.
-
-## Payment environment
-
-Static x402 receiving uses:
-
-```dotenv
-PAYMENTS_RECEIVABLE_ADDRESS=0x...
-PAYMENTS_FACILITATOR_URL=https://facilitator.example
-PAYMENTS_NETWORK=eip155:84532
-```
-
-Supported aliases include `ethereum`, `sepolia`, `base`, `base-sepolia`,
-`solana`, and `solana-devnet`; they normalize to canonical CAIP-2 identifiers.
-Stripe destination mode additionally requires `PAYMENTS_DESTINATION=stripe`
-and `STRIPE_SECRET_KEY` and is Node-only.
-
-Never expose private keys, facilitator tokens, or Stripe secrets in client
-bundles. Use the payments package's explicit Node subpaths for SQLite,
-Postgres, Stripe, or config-file helpers.
-
-## Routes
-
-With an empty base path, HTTP exposes:
-
-- `GET /health`
-- `GET /entrypoints`
-- `POST /entrypoints/:key/invoke`
-- `POST /entrypoints/:key/stream`
-- `GET /.well-known/agent-card.json`
-- `GET /.well-known/agent.json` (legacy alias)
-- `GET /.well-known/oasf-record.json`
-
-Task routes appear only after installing `a2a()`.
-
-Invoke supports an `Idempotency-Key` header. The default bounded in-memory store
-deduplicates retries in one process. Multi-instance deployments should inject a
-durable `HttpIdempotencyStore` through `http({ idempotency: { store } })`.
-
-## Extending the generated agent
-
-Install capabilities as extensions before `.build()`:
-
 ```ts
 const agent = await createAgent(meta)
-  .use(wallets({ config: walletsFromEnv() }))
-  .use(payments({ config: paymentsFromEnv() }))
-  .use(a2a())
-  .use(http())
-  .addEntrypoint(definition)
+  .use(payments({ config: paymentsFromEnv() }))     // money in, x402 on Base
+  .use(keeperhub({ config: keeperhubFromEnv() }))   // money out, via KeeperHub
+  .use(http({ servicePage: serviceUi }))
   .build();
 ```
 
-Each extension owns its runtime (`agent.wallets`, `agent.payments`,
-`agent.a2a`). Do not recreate payment middleware, manifests, or entrypoint maps
-inside an adapter.
+## Rules that are not negotiable
 
-## Verification
+**The chain is the authority; the platform status field is a second opinion.**
+KeeperHub reported `failed` for three transactions that landed on Base mainnet
+(see `evidence/EVIDENCE.md` and KeeperHub/keeperhub#2374). Every write carries a
+`verify` spec — a read of the state it should have changed. When status and
+chain disagree, the result is marked `disputed` and the write is **never
+retried**. Do not "simplify" this by trusting the status field.
+
+**Nothing is hardcoded that can be read.** The liquidation threshold comes from
+`currentLiquidationThreshold` on every pass. The debt asset price is derived
+from Aave's own oracle, not an external feed. If you find yourself adding a
+constant, read it instead.
+
+**Amounts are typed by unit.** `web3/approve-token` takes a human-readable
+decimal; `aave-v3/*` takes wei. `WeiAmount` and `DecimalAmount` are branded so
+the compiler refuses to cross them. Do not cast around this.
+
+**The agent refuses.** If gas costs more than the liquidation it prevents, it
+does nothing and records why. A keeper that always acts is a cron job with a
+wallet.
+
+## Environment
+KEEPERHUB_API_KEY=kh_...
+KEEPERHUB_EXECUTING_ADDRESS=0x... # from kh wallet info — NOT the agent wallet
+KEEPERHUB_CHAIN=base
+PORT=3077
+
+
+KeeperHub signs from a Turnkey wallet that is not the agent's wallet, and an
+API key cannot read that address. It must be configured.
+
+## Gotchas
+
+- `npx tsc` without `outDir` emits `.js` beside the `.ts` sources, and Bun
+  serves the stale JavaScript with no error. Use `tsc --noEmit` to typecheck.
+- Workflows are fixed DAGs with no notion of "already done" — a completed setup
+  step cannot be skipped on re-run. This is why `execute()` takes an
+  idempotency key.
+- A write moving a token needs an ERC-20 approval performed out of band. The
+  missing-allowance failure arrives with no reason attached.
+
+## Commands
 
 ```bash
 bun install
-bun run type-check
-bun run build
-bun test
+bun run dev            # http://localhost:3077
+bun test               # 27 tests
+tsc --noEmit           # typecheck, no emit
 ```
-
-Exercise health, agent-card discovery, invoke, and any priced or streaming route
-before deployment. Call `agent.close()` during graceful shutdown when the
-adapter exposes a long-lived server process.
-
-## Generated deployment overlay
-
-When `lucid.deploy.json` exists, treat it as the complete provider upload
-allowlist. Do not add an environment name merely because it appears in `.env`;
-classify secrets and signing keys explicitly and keep preview identity
-auto-registration disabled. `src/worker.ts` is a Cloudflare entry around the
-same Hono app used by `src/index.ts`, not a second runtime or route registry.
-
-Use `bun run deploy` for the isolated preview. CI also requires
-`CLOUDFLARE_API_TOKEN` and `--yes`. This initial overlay intentionally rejects
-production and preview-cleanup flags until those lifecycles are implemented.

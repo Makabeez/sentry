@@ -115,9 +115,15 @@ export interface ExecuteRequest {
    * Caller-supplied key making the write idempotent. Two calls with the same
    * key inside the window execute once.
    *
-   * Finding 7: the platform reports success for work it did not do. An
-   * idempotency key means a retry after an ambiguous response cannot
-   * double-spend.
+   * The key must bind to INTENT, not to an observation. Keying on an observed
+   * event — a block, a log index, a health-factor reading — does not protect
+   * you: a fresh poll produces a genuinely new observation, a new key, and a
+   * second write. The correct key for "repay this position back to target" is
+   * the position and the action, not the reading that prompted it.
+   *
+   * A record is claimed BEFORE the request is sent and released only when the
+   * outcome is resolved. While a write is unresolved, a second call with the
+   * same key is refused rather than executed.
    */
   idempotencyKey?: string;
   /**
@@ -145,9 +151,23 @@ export interface ReadRequest {
   chain?: ChainName;
 }
 
+/**
+ * Outcome of a write.
+ *
+ * `unconfirmed` is the state that matters and that platforms tend not to model:
+ * the transaction was broadcast, and we could not read a receipt that settles
+ * whether it landed. Collapsing it into `failed` is what makes a retry look
+ * safe — and a retry of a write that did land moves capital twice.
+ */
+export type ExecutionStatus =
+  | 'completed'
+  | 'failed'
+  | 'running'
+  | 'unconfirmed';
+
 export interface ExecutionResult {
   executionId: string;
-  status: 'completed' | 'failed' | 'running';
+  status: ExecutionStatus;
   txHash?: string;
   explorerUrl?: string;
   gasUsed?: string;
@@ -209,6 +229,29 @@ export class VerificationError extends KeeperHubError {
   ) {
     super(message, 'VERIFICATION_FAILED', executionId);
     this.name = 'VerificationError';
+  }
+}
+
+/**
+ * Raised when a write with the same intent key is already in flight or
+ * unresolved. The safe response is to wait and re-read, never to retry.
+ */
+export class WriteInFlightError extends KeeperHubError {
+  constructor(
+    key: string,
+    readonly since: number,
+    readonly priorExecutionId?: string,
+  ) {
+    super(
+      `A write with intent key "${key}" has been outstanding since ` +
+        `${new Date(since).toISOString()}` +
+        (priorExecutionId ? ` (execution ${priorExecutionId})` : '') +
+        `. Its outcome is unresolved, so issuing another would risk moving ` +
+        `capital twice. Read the chain and resolve the first one instead.`,
+      'WRITE_IN_FLIGHT',
+      priorExecutionId,
+    );
+    this.name = 'WriteInFlightError';
   }
 }
 

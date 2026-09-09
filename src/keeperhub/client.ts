@@ -13,6 +13,7 @@ import {
   KeeperHubError,
   SUPPORTED_CHAINS,
   VerificationError,
+  WriteInFlightError,
   type ChainName,
   type ExecuteRequest,
   type ExecutionResult,
@@ -39,9 +40,21 @@ export type Fetcher = (
   init: { method: string; headers: Record<string, string>; body?: string; signal?: AbortSignal },
 ) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
+/**
+ * A claim on an intent key.
+ *
+ * `pending` is written before the request is sent. Until the outcome resolves,
+ * a second call with the same key is refused. This is the whole point: the old
+ * design wrote the cache entry at the END of execute(), after verification —
+ * so a write that threw left no record, and the guard was populated only on
+ * the paths that did not need it. A reported failure is exactly when there was
+ * the least protection.
+ */
 interface CacheEntry {
   at: number;
-  result: ExecutionResult;
+  pending: boolean;
+  executionId?: string;
+  result?: ExecutionResult;
 }
 
 export class KeeperHubClient implements KeeperHubRuntime {
@@ -217,16 +230,29 @@ export class KeeperHubClient implements KeeperHubRuntime {
   }
 
   async execute(request: ExecuteRequest): Promise<ExecutionResult> {
-    if (request.idempotencyKey) {
-      const cached = this.idempotencyCache.get(request.idempotencyKey);
-      if (cached && Date.now() - cached.at < this.budget.windowMs) {
-        return { ...cached.result, deduplicated: true };
+    const key = request.idempotencyKey;
+
+    if (key) {
+      const claim = this.idempotencyCache.get(key);
+      if (claim && Date.now() - claim.at < this.budget.windowMs) {
+        if (claim.pending) {
+          throw new WriteInFlightError(key, claim.at, claim.executionId);
+        }
+        if (claim.result) {
+          return { ...claim.result, deduplicated: true };
+        }
       }
+      // Claim the key before anything is sent. If the process dies here, the
+      // claim dies with it — which is a durability gap, stated in the README
+      // rather than papered over.
+      this.idempotencyCache.set(key, { at: Date.now(), pending: true });
     }
 
     if (this.simulateFirst) {
       const simulation = await this.simulate(request);
       if (!simulation.ok) {
+        // Nothing was broadcast, so the intent is free again.
+        if (key) this.idempotencyCache.delete(key);
         throw new KeeperHubError(
           `Simulation failed, write aborted: ${simulation.reason ?? 'no reason given'}`,
           'SIMULATION_FAILED',
@@ -234,7 +260,12 @@ export class KeeperHubClient implements KeeperHubRuntime {
       }
     }
 
-    this.consumeBudget();
+    try {
+      this.consumeBudget();
+    } catch (error) {
+      if (key) this.idempotencyCache.delete(key);
+      throw error;
+    }
 
     const chainId = SUPPORTED_CHAINS[request.chain ?? this.chain];
     const response = await this.call<{
@@ -249,6 +280,11 @@ export class KeeperHubClient implements KeeperHubRuntime {
       ...request.args,
     });
 
+    if (key) {
+      const claim = this.idempotencyCache.get(key);
+      if (claim) claim.executionId = response.executionId;
+    }
+
     const receipt = response.receipts?.[0];
     let result: ExecutionResult = {
       executionId: response.executionId,
@@ -260,6 +296,15 @@ export class KeeperHubClient implements KeeperHubRuntime {
       sponsored: response.sponsored ?? false,
       deduplicated: false,
     };
+
+    // A reported failure that carries a transaction hash is not a failure, it
+    // is an unreadable outcome. "Failed" asserts the write did not land, which
+    // is a claim we cannot support — all we know is that we could not confirm
+    // it. Keeping the hash and saying `unconfirmed` is what lets a caller
+    // resolve it instead of retrying blind.
+    if (result.status === 'failed' && result.txHash) {
+      result = { ...result, status: 'unconfirmed' };
+    }
 
     // Do NOT short-circuit on a reported failure. Verify anyway.
     //
@@ -283,7 +328,9 @@ export class KeeperHubClient implements KeeperHubRuntime {
 
     if (request.verify) {
       const verified = await this.runVerification(request.verify, result);
-      const disputed = verified.passed && result.status === 'failed';
+      const disputed =
+        verified.passed &&
+        (result.status === 'failed' || result.status === 'unconfirmed');
       result = { ...result, verified, disputed };
 
       if (disputed) {
@@ -296,6 +343,9 @@ export class KeeperHubClient implements KeeperHubRuntime {
       }
 
       if (!verified.passed) {
+        // The claim is left pending on purpose. We do not know whether the
+        // write landed, and releasing it here would let the next poll issue a
+        // second one.
         throw new VerificationError(
           `KeeperHub reported ${result.status} for ${response.executionId} and the ` +
             `read-back does not confirm the position changed` +
@@ -305,12 +355,12 @@ export class KeeperHubClient implements KeeperHubRuntime {
           response.executionId,
         );
       }
-    } else if (result.status === 'failed') {
+    } else if (result.status === 'failed' || result.status === 'unconfirmed') {
       // Without a read-back there is nothing to appeal to, so the status is
       // all we have — and it has been wrong. Say so in the error rather than
       // implying the write definitely did not happen.
       throw new KeeperHubError(
-        `KeeperHub reported failed for ${response.executionId} and no verify ` +
+        `KeeperHub reported ${result.status} for ${response.executionId} and no verify ` +
           `spec was supplied, so this cannot be checked against chain state. ` +
           `Do not assume the write did not land: reported failures have ` +
           `executed successfully on-chain. Fetch the receipt before retrying.`,
@@ -319,8 +369,15 @@ export class KeeperHubClient implements KeeperHubRuntime {
       );
     }
 
-    if (request.idempotencyKey) {
-      this.idempotencyCache.set(request.idempotencyKey, { at: Date.now(), result });
+    // Outcome resolved: release the claim and cache the result so a genuine
+    // duplicate returns it rather than re-executing.
+    if (key) {
+      this.idempotencyCache.set(key, {
+        at: Date.now(),
+        pending: false,
+        executionId: result.executionId,
+        result,
+      });
     }
 
     return result;

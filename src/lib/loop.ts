@@ -213,9 +213,11 @@ export async function evaluate(
       interestRateMode: '2',
       onBehalfOf: position.user,
     },
-    // One repayment per (position, health-factor band) episode. A retry after
-    // an ambiguous response cannot repay twice.
-    idempotencyKey: `repay:${position.user}:${Math.floor(healthFactor * 100)}`,
+    // Keyed on INTENT — this position, this action — not on the observation
+    // that prompted it. Keying on the health-factor reading was the bug: a
+    // fresh poll sees a genuinely different reading, produces a different key,
+    // and repays a second time. Raised by @Madhav-Gupta-28.
+    idempotencyKey: `repay:${position.user}:${position.debtAsset}`,
     verify: {
       protocol: 'aave-v3',
       action: 'get-user-account-data',

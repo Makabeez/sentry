@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import { KeeperHubClient, type Fetcher } from '../src/keeperhub/client.js';
 import {
   BudgetExceededError,
+  WriteInFlightError,
   VerificationError,
   decimal,
   fromWei,
@@ -386,4 +387,119 @@ test('a reported failure with no verify spec throws, but says not to assume', as
       return true;
     },
   );
+});
+
+
+// ------------------------------------------------- intent keys, not observations
+// Raised by @Madhav-Gupta-28 in the KeeperHub builders channel: an idempotency
+// key derived from an observation (chain id, tx hash, log index) does not
+// protect against this bug. A fresh poll sees the position genuinely still
+// under threshold, produces a NEW observation and a NEW key, and executes
+// again. The guard has to sit at the intent level, against an unresolved
+// broadcast.
+//
+// The original implementation was worse than he knew: the cache entry was
+// written at the END of execute(), after verification, so a write that threw
+// left no record at all.
+
+test('an unresolved write blocks a second call with the same intent key', async () => {
+  let executes = 0;
+  const { fetcher } = stubFetcher((path) => {
+    if (path.includes('read-state')) {
+      // The position has NOT recovered: verification will fail and execute throws.
+      return { payload: { result: { healthFactor: '1040000000000000000' } } };
+    }
+    executes += 1;
+    return { payload: { executionId: 'exec_ambiguous', status: 'failed' } };
+  });
+
+  const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
+  const request = {
+    protocol: 'aave-v3',
+    action: 'repay',
+    args: {},
+    // Keyed on the position and the action — the intent — not on the reading.
+    idempotencyKey: 'repay:0x972A…8a37',
+    verify: {
+      protocol: 'aave-v3',
+      action: 'read-state',
+      args: {},
+      expect: (r: unknown) =>
+        BigInt((r as { healthFactor: string }).healthFactor) > 1_050_000_000_000_000_000n,
+    },
+  };
+
+  await assert.rejects(client.execute(request));
+  assert.equal(executes, 1);
+
+  // A fresh poll would produce a new observation and call again. It must not
+  // reach the network while the first outcome is unresolved.
+  await assert.rejects(client.execute(request), (error: unknown) => {
+    const err = error as WriteInFlightError;
+    assert.ok(err instanceof WriteInFlightError);
+    assert.match(err.message, /outstanding since/);
+    assert.match(err.message, /moving capital twice/);
+    return true;
+  });
+  assert.equal(executes, 1, 'the second call must not execute');
+});
+
+test('a failed pre-flight releases the intent key, since nothing was sent', async () => {
+  let executes = 0;
+  const { fetcher } = stubFetcher((_path, body) => {
+    if ((body as { simulateOnly?: boolean })?.simulateOnly === true) {
+      return { payload: { success: false, error: 'insufficient balance' } };
+    }
+    executes += 1;
+    return { payload: OK_EXECUTION };
+  });
+
+  const client = new KeeperHubClient(
+    { apiKey: 'k', simulateBeforeWrite: true },
+    fetcher,
+  );
+  const request = {
+    protocol: 'aave-v3',
+    action: 'repay',
+    args: {},
+    idempotencyKey: 'repay:0x972A…8a37',
+  };
+
+  await assert.rejects(client.execute(request), /Simulation failed/);
+  // Nothing was broadcast, so the intent is free — not stuck forever.
+  await assert.rejects(client.execute(request), /Simulation failed/);
+  assert.equal(executes, 0);
+});
+
+test('a reported failure carrying a tx hash is unconfirmed, not failed', async () => {
+  const { fetcher } = stubFetcher((path) => {
+    if (path.includes('read-state')) {
+      return { payload: { result: { healthFactor: '1350000000000000000' } } };
+    }
+    return {
+      payload: {
+        executionId: 'exec_unreadable',
+        status: 'failed',
+        transactionHash: '0x59c7eb8a',
+      },
+    };
+  });
+
+  const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
+  const result = await client.execute({
+    protocol: 'aave-v3',
+    action: 'repay',
+    args: {},
+    verify: {
+      protocol: 'aave-v3',
+      action: 'read-state',
+      args: {},
+      expect: (r) =>
+        BigInt((r as { healthFactor: string }).healthFactor) > 1_050_000_000_000_000_000n,
+    },
+  });
+
+  assert.equal(result.status, 'unconfirmed', '"failed" asserts more than we know');
+  assert.equal(result.txHash, '0x59c7eb8a', 'the hash is what lets a caller resolve it');
+  assert.equal(result.disputed, true);
 });

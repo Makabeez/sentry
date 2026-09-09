@@ -46,6 +46,7 @@ does nothing and records why. A keeper that always acts is a cron job with a
 wallet.
 
 ## Environment
+
 KEEPERHUB_API_KEY=kh_...
 KEEPERHUB_EXECUTING_ADDRESS=0x... # from kh wallet info — NOT the agent wallet
 KEEPERHUB_CHAIN=base

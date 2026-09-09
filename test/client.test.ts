@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { KeeperHubClient, type Fetcher } from '../src/client.js';
+import { KeeperHubClient, type Fetcher } from '../src/keeperhub/client.js';
 import {
   BudgetExceededError,
   VerificationError,
@@ -16,7 +16,7 @@ import {
   fromWei,
   toWei,
   wei,
-} from '../src/types.js';
+} from '../src/keeperhub/types.js';
 
 /** Build a fetcher that replays scripted responses and records the calls. */
 function stubFetcher(

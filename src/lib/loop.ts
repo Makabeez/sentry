@@ -195,12 +195,18 @@ export async function evaluate(
 
   const repayRaw = usdToTokenRaw(repayUsd, debtPriceUsd, position.debtDecimals);
 
-  // The repayment, and the read that decides whether to believe it.
+  // The repayment, and the two independent checks that decide whether to
+  // believe it.
   //
-  // The verify block is the point of the whole file. KeeperHub reporting
-  // success means a transaction was accepted, not that the position moved.
-  // Round one produced a deposit(0, receiver) that succeeded, cost gas, and
-  // did nothing.
+  // Execution status answers "did this call do something?". The read-back
+  // answers "did the position actually move?". Neither is sufficient alone:
+  //   - status success + no state change  =>  the deposit(0, receiver) case
+  //     from round one, which cost gas and did nothing.
+  //   - state change + status failed      =>  someone else fixed the position
+  //     while this call was failing, which is not a defence this agent
+  //     performed. Observed live on 2026-09-09.
+  // The client rejects a failed execution before the read-back ever runs, so
+  // only the first case reaches the verify block below.
   const execution = await keeperhub.execute({
     protocol: 'aave-v3',
     action: 'repay',
@@ -224,7 +230,8 @@ export async function evaluate(
       },
       describe:
         `health factor should be strictly higher than ${healthFactor.toFixed(4)} ` +
-        `after repaying $${repayUsd.toFixed(2)}`,
+        `after repaying $${repayUsd.toFixed(2)}. This proves the position moved, ` +
+        `not that this call moved it — execution status carries that part`,
     },
   });
 

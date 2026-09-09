@@ -261,13 +261,33 @@ export class KeeperHubClient implements KeeperHubRuntime {
       deduplicated: false,
     };
 
+    // A failed execution is not a candidate for verification.
+    //
+    // The read-back asks "did the state change?", which any actor can satisfy.
+    // If this call failed and something else moved the position in the same
+    // window, verifying would report a success this call did not cause. That
+    // happened during development on 2026-09-09: a repay failed, an unrelated
+    // workflow fixed the position seconds later, and the read-back passed.
+    // Execution status establishes causation; the read-back establishes state.
+    // Both are required.
+    if (result.status === 'failed') {
+      throw new KeeperHubError(
+        `KeeperHub reported failed for ${response.executionId}. Skipping the ` +
+          `read-back: a state check after a failed execution can be satisfied ` +
+          `by another actor's transaction and would report a success this call ` +
+          `did not cause.`,
+        'EXECUTION_FAILED',
+        response.executionId,
+      );
+    }
+
     if (request.verify) {
       const verified = await this.runVerification(request.verify, result);
       result = { ...result, verified };
       if (!verified.passed) {
         throw new VerificationError(
           `KeeperHub reported ${result.status} for ${response.executionId}, but the ` +
-            `read-back did not confirm it` +
+            `read-back did not confirm the position changed` +
             (request.verify.describe ? `: ${request.verify.describe}` : '') +
             `. Observed: ${JSON.stringify(verified.observed)}`,
           verified.observed,

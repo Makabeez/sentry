@@ -283,3 +283,57 @@ test('the API key never appears in an error message', async () => {
     },
   );
 });
+
+
+// --------------------------------------------------- causation, not just state
+// Regression for a real false positive on 2026-09-09: a repay failed, an
+// unrelated workflow improved the position seconds later, and the read-back
+// passed. The agent reported a defence it had not performed.
+
+test('a failed execution throws before the read-back can be satisfied by someone else', async () => {
+  let verifyReads = 0;
+  const { fetcher } = stubFetcher((path, body) => {
+    const isRead = (body as { simulateOnly?: boolean }) && path.includes('get-user-account-data');
+    if (isRead) {
+      verifyReads += 1;
+      // The position looks healthy — but not because of this call.
+      return { payload: { result: { healthFactor: '1350000000000000000' } } };
+    }
+    return { payload: { executionId: 'exec_failed', status: 'failed' } };
+  });
+
+  const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
+
+  await assert.rejects(
+    client.execute({
+      protocol: 'aave-v3',
+      action: 'repay',
+      args: {},
+      verify: {
+        protocol: 'aave-v3',
+        action: 'get-user-account-data',
+        args: {},
+        expect: () => true, // would pass, which is exactly the danger
+      },
+    }),
+    (error: unknown) => {
+      const err = error as Error;
+      assert.match(err.message, /Skipping the read-back/);
+      assert.match(err.message, /did not cause/);
+      return true;
+    },
+  );
+
+  assert.equal(verifyReads, 0, 'the read-back must not run after a failed execution');
+});
+
+test('a failed execution throws even with no verify spec', async () => {
+  const { fetcher } = stubFetcher(() => ({
+    payload: { executionId: 'exec_failed_2', status: 'failed' },
+  }));
+  const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
+  await assert.rejects(
+    client.execute({ protocol: 'aave-v3', action: 'repay', args: {} }),
+    /KeeperHub reported failed for exec_failed_2/,
+  );
+});

@@ -1,114 +1,168 @@
-# sentry
+# Sentry
 
-Generated Lucid service with one canonical runtime and the selected Hono,
-Express, TanStack Start, or Next.js adapter.
+An agent that keeps borrowers out of liquidation.
 
-## Run
+It watches an Aave V3 position, and when the health factor crosses a threshold
+it repays debt through [KeeperHub](https://keeperhub.com), then reads the
+position back on-chain to check the repayment actually happened. It is paid per
+position over x402, and it refuses to act when the gas would cost more than the
+liquidation it prevents.
 
-Inspect `package.json` and `.env.example` before installing. Keep the package
-set on the same Stable or Next channel used by the CLI that generated it.
+Built on [Lucid Agents](https://github.com/daydreamsai/lucid-agents) (Daydreams)
+for the KeeperHub "Agent Economy" hackathon, September 2026.
+
+---
+
+## Where the agent is
+
+**[`src/lib/loop.ts`](src/lib/loop.ts)** — the decision loop. One file, read it
+top to bottom. Everything else is wiring.
+
+```
+src/lib/loop.ts          the agent: read → decide → execute → verify
+src/lib/agent.ts         entrypoints and the poll timer
+src/keeperhub/           the execution extension (also published standalone)
+evidence/EVIDENCE.md     every transaction, including the failures
+```
+
+The loop in full:
+
+```
+hf = aave.getUserAccountData(user).healthFactor     via KeeperHub
+  hf > actAt                    → hold, log the margin
+  repay cost > liquidation cost → refuse, log the reason
+  otherwise                     → repay through KeeperHub
+                                  → read the position back
+                                  → if the chain disagrees, do not claim success
+```
+
+## Try it in one command
 
 ```bash
-bun install
-bun run type-check
-bun run build
-bun run dev
+bun install && bun run dev
+
+curl -s -X POST localhost:3077/entrypoints/health/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"0x972A2E27b32152064F65a3Dda489F3899A168a37"}'
 ```
 
-The adapter-specific server prints or uses its local port (normally `3000`).
-Check:
+`health` is free. No wallet, no key, no payment. It reads the live position on
+Base through KeeperHub and returns the real numbers.
 
 ```bash
-curl -i http://localhost:3000/health
-curl -i http://localhost:3000/.well-known/agent-card.json
-curl -i http://localhost:3000/entrypoints/echo/invoke \
-  -H 'content-type: application/json' \
-  -H 'idempotency-key: generated-echo-request-000001' \
-  --data '{"input":{"text":"hello"}}'
+bun test        # 27 tests, no network required
 ```
 
-TanStack/Next generated APIs use the configured `/api/agent` base path; inspect
-the generated Agent Card rather than assuming the root paths above.
+---
 
-## Runtime boundary
+## The thing worth knowing
 
-- Core owns the typed entrypoint registry.
-- `@lucid-agents/http` owns request validation, canonical routes,
-  authorization, idempotency, and SSE.
-- The selected adapter binds that runtime; do not add another paywall,
-  manifest, or entrypoint map.
+**KeeperHub's execution status reported `failed` for three transactions that
+succeeded on-chain.** Base mainnet, 9 September 2026:
 
-The default `echo` entrypoint is free. To sell a capability, add an explicit USD
-decimal `price` such as `'0.01'` and configure the complete x402 seller group in
-`.env`. There is no global default-price environment variable.
+| execution | reported | transaction |
+|---|---|---|
+| `hr13f96q8lqf11d0ivwlr` | `failed` | [`0x6792fea2…`](https://basescan.org/tx/0x6792fea2ceaad92876cf2e47b00c6952689257e4ef22b876d08c326aa5afa33f) |
+| `0cawawqobfb68ujng3add` | `failed` | [`0x6fb59e90…`](https://basescan.org/tx/0x6fb59e908412b357d4ca1c46541504263183cf7e9982d92f393e5858c753001d) |
+| `e8dtq9t8lzq9qerf3igak` | `failed` | [`0x59c7eb8a…`](https://basescan.org/tx/0x59c7eb8a837c4ed0bcf097d2bab8b6c740d606b46c77c2bca6556aff279415df) — health factor moved 1.0439 → 1.3500 |
 
-## Secrets and state
+Provable without a receipt — `approve` sets an allowance, `transferFrom`
+decrements it:
 
-The blank service does not require a private key merely to boot or receive at a
-public destination address. Buyer wallets, identity signers, facilitator auth,
-Stripe keys, and model-provider keys are separate server-only roles.
-
-In-memory payment, SIWX, and HTTP idempotency defaults are for one-process
-development. Before multiple replicas, inject the durable stores documented by
-the installed package surface and test a same-key replay from another instance.
-
-See `AGENTS.md` for extension/adaptor rules and the repository documentation
-for release channels, x402, retries, deployment, and production checks.
-
-## Deploy to Cloudflare
-
-This Hono project keeps `src/index.ts` as its local Bun server and uses the
-fetch-native `src/worker.ts` only for Cloudflare. The default command uploads an
-isolated Worker version with the stable `preview` alias; it does not change the
-production deployment.
-
-Authenticate once for interactive use, then deploy:
-
-```bash
-bunx wrangler login
-bun run deploy
+```
+approved              2,000,000,000,000,000 wei
+repay amount          1,681,263,151,586,920 wei
+allowance remaining     318,736,848,413,080 wei
+                      -------------------------
+                      2,000,000,000,000,000 wei   exact
 ```
 
-The command prints the returned preview URL and verifies these same-origin
-routes before reporting success:
+An agent that trusts the status field retries, and each retry moves capital
+again. Two of those three happened in one session for exactly that reason. The
+third was blocked only by the exhausted allowance.
 
-```text
-/
-/health
-/.well-known/agent-card.json
+Reported upstream: [KeeperHub/keeperhub#2374](https://github.com/KeeperHub/keeperhub/issues/2374).
+
+**So the chain is the authority and the status is a second opinion.** When they
+disagree the decision carries `disputed`, and the write is never retried:
+
+```
+repaid $4.23 — hf 1.0439 -> 1.3500 — DISPUTED: platform reported failure,
+chain confirms the repay
 ```
 
-Only values named in `lucid.deploy.json` can be uploaded. The generated
-allowlist covers agent metadata plus configured payment, wallet, Stripe, and
-model-provider values. Secret-classified values use encrypted Worker secrets;
-all confirmations are redacted. Arbitrary `.env` entries are ignored.
+All four combinations of status × chain state are handled and tested.
 
-Preview deployment always forces `IDENTITY_AUTO_REGISTER=false` and
-`REGISTER_IDENTITY=false`. A configured private signing key or mainnet payment
-network requires explicit confirmation. Review those values before continuing;
-do not use a production signing key in a preview unless that exposure is
-intentional.
+---
 
-For non-interactive CI, provide a scoped Cloudflare token and both required
-confirmation inputs:
+## Entrypoints
 
-```bash
-export CLOUDFLARE_API_TOKEN='replace-with-a-scoped-token'
-bun run deploy -- --yes
-```
+| | price | what it does |
+|---|---|---|
+| `health` | free | current health factor, collateral, debt, borrowing power |
+| `watch` | paid | register a position; polls and defends it |
+| `defend` | paid | evaluate once now, and repay if warranted |
+| `journal` | free | every decision made, including the ones to do nothing |
 
-If authentication fails, run `bunx wrangler whoami`, then `bunx wrangler login`
-again or verify the token's Worker permissions. This tracer release rejects
-`--prod` and `--destroy-preview`; those operations are not silently mapped to a
-preview upload.
+`health` and `journal` are free deliberately. You should be able to see your own
+risk, and audit what the agent did, without paying anyone.
 
-To scaffold the same local Hono project without any deployment dependency,
-Worker entry, Wrangler configuration, or deployment manifest, generate it with
-`--no-deploy`:
+The agent card at `/.well-known/agent-card.json` advertises the execution layer,
+so another agent can discover that this one moves value and under what
+guarantees, without reading the source.
 
-```bash
-bunx @lucid-agents/cli sentry \
-  --adapter=hono \
-  --template=blank \
-  --no-deploy
-```
+## Two things it does that a cron job does not
+
+**It refuses.** Liquidation on a $6 debt costs about $0.30 at a 5% penalty. If
+gas costs more than that, repaying destroys more value than it protects, and the
+agent records the refusal instead of acting.
+
+**It derives, rather than assumes.** The liquidation threshold is read from
+`currentLiquidationThreshold` on every pass, not hardcoded — the first live read
+gave 0.780, matching the 7800 bps Aave reports. The debt asset price comes from
+Aave's own oracle rather than an external feed, so the agent solves for the
+health factor the protocol actually reports. Target 1.35, achieved 1.3500000415.
+
+---
+
+## KeeperHub surfaces used
+
+MCP server, REST API (`/api/execute/{protocol}/{action}`), `kh` CLI, workflow
+builder, audit trail, gas sponsorship, and Turnkey wallets. Protocol actions:
+`aave-v3/supply`, `aave-v3/borrow`, `aave-v3/repay`,
+`aave-v3/get-user-account-data`, `aave-v3/get-user-reserve-data`,
+`web3/approve-token`.
+
+Payments in are x402 on Base via Lucid's `payments()` extension.
+
+## What is unfinished
+
+**State is in memory.** Watched positions do not survive a restart. Durable
+storage for a monitor is the gap described in
+[KeeperHub/keeperhub#2293](https://github.com/KeeperHub/keeperhub/issues/2293);
+until then an in-memory `Map` is what this is, and calling it anything else
+would be a lie.
+
+**It polls.** There is no trigger for a threshold on derived state — see
+[KeeperHub/keeperhub#2239](https://github.com/KeeperHub/keeperhub/issues/2239),
+which uses "health factor below 1.05" as its own example. A polling interval
+affordable enough to run is long enough to miss a fast crossing, and I have not
+measured how often that matters.
+
+**Approvals are not composed.** A write that moves a token needs an ERC-20
+approval performed out of band. When it is missing, the failure arrives with no
+reason attached — diagnosing it the first time meant decoding calldata by hand.
+
+**One position, one debt asset, one chain.** Nothing about the loop is specific
+to WETH or Base, but nothing else has been tested.
+
+**The demo position was constructed.** The health factor was walked down by
+borrowing, not by waiting for a price move. Every borrow is in
+[`evidence/EVIDENCE.md`](evidence/EVIDENCE.md), along with the approvals that
+went to the wrong spender, the borrow that exceeded the cap by $0.0018, and a
+verification bug of my own that took two attempts to get right.
+
+---
+
+MIT. Extension published separately at
+[Makabeez/keeperhub-lucid](https://github.com/Makabeez/keeperhub-lucid).

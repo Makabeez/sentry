@@ -19,7 +19,9 @@ timestamp two seconds before the execution record was written:
 |---|---|---|---|
 | `hr13f96q8lqf11d0ivwlr` | `failed` | [`0x6792fea2…`](https://basescan.org/tx/0x6792fea2ceaad92876cf2e47b00c6952689257e4ef22b876d08c326aa5afa33f) | 07:39:25 |
 | `0cawawqobfb68ujng3add` | `failed` | [`0x6fb59e90…`](https://basescan.org/tx/0x6fb59e908412b357d4ca1c46541504263183cf7e9982d92f393e5858c753001d) | 07:58:51 |
-| `e8dtq9t8lzq9qerf3igak` | `failed` | position moved 1.0439 → 1.3500 | 08:38:57 |
+| `e8dtq9t8lzq9qerf3igak` | `failed` | [`0x59c7eb8a…`](https://basescan.org/tx/0x59c7eb8a837c4ed0bcf097d2bab8b6c740d606b46c77c2bca6556aff279415df) | 08:38:49 |
+
+The third is the sharpest: the transaction was mined at 08:38:49 and the execution record calling it a failure was written at 08:38:57, eight seconds later.
 
 Each returned the same error, with no reason string attached:
 
@@ -101,7 +103,8 @@ Aave V3 on Base. 25 USDC supplied as collateral, WETH borrowed against it.
 | 7 | Repay 0.0017107 — **by the agent** | 1.3474 | [`0x6792fea2…`](https://basescan.org/tx/0x6792fea2ceaad92876cf2e47b00c6952689257e4ef22b876d08c326aa5afa33f) |
 | 8 | Borrow 0.001696 WETH | **1.0439** | [`0x91805235…`](https://basescan.org/tx/0x918052351491077af67714c81fb9b3a34892d1f3810b083e3c1a47c39dc11ce0) |
 | 9 | Repay 0.0016873 — **by the agent** | 1.3500 | [`0x6fb59e90…`](https://basescan.org/tx/0x6fb59e908412b357d4ca1c46541504263183cf7e9982d92f393e5858c753001d) |
-| 10 | Borrow, then repay 0.0016813 — **by the agent, DISPUTED** | 1.0439 → **1.3500** | execution `e8dtq9t8lzq9qerf3igak` |
+| 10 | Borrow 0.0016616 WETH | **1.0439** | [`0x7069ff44…`](https://basescan.org/tx/0x7069ff448abefa671824864eda5a57adae42a71e3f133fc78811a796498555ea) |
+| 11 | Repay 0.0016813 — **by the agent, DISPUTED** | **1.3500** | [`0x59c7eb8a…`](https://basescan.org/tx/0x59c7eb8a837c4ed0bcf097d2bab8b6c740d606b46c77c2bca6556aff279415df) |
 
 The position was walked into danger deliberately, by borrowing. Nothing here
 waited on a price move, and saying so is more useful than implying otherwise.

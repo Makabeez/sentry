@@ -261,39 +261,62 @@ export class KeeperHubClient implements KeeperHubRuntime {
       deduplicated: false,
     };
 
-    // A failed execution is not a candidate for verification.
+    // Do NOT short-circuit on a reported failure. Verify anyway.
     //
-    // The read-back asks "did the state change?", which any actor can satisfy.
-    // If this call failed and something else moved the position in the same
-    // window, verifying would report a success this call did not cause. That
-    // happened during development on 2026-09-09: a repay failed, an unrelated
-    // workflow fixed the position seconds later, and the read-back passed.
-    // Execution status establishes causation; the read-back establishes state.
-    // Both are required.
-    if (result.status === 'failed') {
-      throw new KeeperHubError(
-        `KeeperHub reported failed for ${response.executionId}. Skipping the ` +
-          `read-back: a state check after a failed execution can be satisfied ` +
-          `by another actor's transaction and would report a success this call ` +
-          `did not cause.`,
-        'EXECUTION_FAILED',
-        response.executionId,
-      );
-    }
+    // On 2026-09-09, Base mainnet, KeeperHub reported `failed` for two
+    // aave-v3/repay executions that both landed on-chain:
+    //
+    //   hr13f96q8lqf11d0ivwlr  07:39:26  ->  tx 0x6792fea2… at 07:39:25
+    //   0cawawqobfb68ujng3add  07:58:53  ->  tx 0x6fb59e90… at 07:58:51
+    //
+    // Both moved the position. Both were reported as failures. An agent that
+    // trusts the status field retries, and each retry repays again — here only
+    // an exhausted ERC-20 allowance stopped a third attempt. In an execution
+    // layer sold on determinism, a false negative is more dangerous than a
+    // false positive: the caller's instinct is to try again.
+    //
+    // So the read-back is the authority on whether the world changed, and the
+    // status is treated as a second opinion. When they disagree the result is
+    // marked `disputed` and both signals are preserved, rather than resolving
+    // it wrongly in either direction. A caller that cannot tolerate ambiguity
+    // should check `disputed` and fetch the receipt itself.
 
     if (request.verify) {
       const verified = await this.runVerification(request.verify, result);
-      result = { ...result, verified };
+      const disputed = verified.passed && result.status === 'failed';
+      result = { ...result, verified, disputed };
+
+      if (disputed) {
+        console.warn(
+          `[keeperhub] execution ${response.executionId} reported ` +
+            `"${result.status}" but the on-chain read-back confirms the state ` +
+            `changed. Treating the chain as authoritative and NOT retrying. ` +
+            `Check the receipt before acting on the status field.`,
+        );
+      }
+
       if (!verified.passed) {
         throw new VerificationError(
-          `KeeperHub reported ${result.status} for ${response.executionId}, but the ` +
-            `read-back did not confirm the position changed` +
+          `KeeperHub reported ${result.status} for ${response.executionId} and the ` +
+            `read-back does not confirm the position changed` +
             (request.verify.describe ? `: ${request.verify.describe}` : '') +
             `. Observed: ${JSON.stringify(verified.observed)}`,
           verified.observed,
           response.executionId,
         );
       }
+    } else if (result.status === 'failed') {
+      // Without a read-back there is nothing to appeal to, so the status is
+      // all we have — and it has been wrong. Say so in the error rather than
+      // implying the write definitely did not happen.
+      throw new KeeperHubError(
+        `KeeperHub reported failed for ${response.executionId} and no verify ` +
+          `spec was supplied, so this cannot be checked against chain state. ` +
+          `Do not assume the write did not land: reported failures have ` +
+          `executed successfully on-chain. Fetch the receipt before retrying.`,
+        'EXECUTION_FAILED_UNVERIFIED',
+        response.executionId,
+      );
     }
 
     if (request.idempotencyKey) {

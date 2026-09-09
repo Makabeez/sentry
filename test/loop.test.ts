@@ -197,6 +197,6 @@ test('a repayment the chain does not confirm throws rather than reporting succes
 
   await assert.rejects(
     evaluate(client, POSITION, 2499),
-    /read-back did not confirm.*health factor should be strictly higher/s,
+    /read-back does not confirm.*health factor should be strictly higher/s,
   );
 });

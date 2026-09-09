@@ -58,6 +58,8 @@ export type LoopDecision =
       executionId: string;
       txHash?: string;
       explorerUrl?: string;
+      /** Platform reported failure; the chain says otherwise. Do not retry. */
+      disputed?: boolean;
     };
 
 export interface AccountData {
@@ -195,18 +197,13 @@ export async function evaluate(
 
   const repayRaw = usdToTokenRaw(repayUsd, debtPriceUsd, position.debtDecimals);
 
-  // The repayment, and the two independent checks that decide whether to
-  // believe it.
+  // The repayment, and the read that decides whether to believe it.
   //
-  // Execution status answers "did this call do something?". The read-back
-  // answers "did the position actually move?". Neither is sufficient alone:
-  //   - status success + no state change  =>  the deposit(0, receiver) case
-  //     from round one, which cost gas and did nothing.
-  //   - state change + status failed      =>  someone else fixed the position
-  //     while this call was failing, which is not a defence this agent
-  //     performed. Observed live on 2026-09-09.
-  // The client rejects a failed execution before the read-back ever runs, so
-  // only the first case reaches the verify block below.
+  // The platform's status field is a second opinion, not the authority. On
+  // Base mainnet, 2026-09-09, two repays were reported `failed` and both
+  // landed on-chain — an agent that trusted the status would have retried and
+  // repaid twice. The chain is the authority; a disagreement is surfaced as
+  // `disputed` rather than resolved by guessing.
   const execution = await keeperhub.execute({
     protocol: 'aave-v3',
     action: 'repay',
@@ -230,8 +227,7 @@ export async function evaluate(
       },
       describe:
         `health factor should be strictly higher than ${healthFactor.toFixed(4)} ` +
-        `after repaying $${repayUsd.toFixed(2)}. This proves the position moved, ` +
-        `not that this call moved it — execution status carries that part`,
+        `after repaying $${repayUsd.toFixed(2)}`,
     },
   });
 
@@ -249,6 +245,7 @@ export async function evaluate(
     executionId: execution.executionId,
     txHash: execution.txHash,
     explorerUrl: execution.explorerUrl,
+    disputed: execution.disputed,
   };
 }
 
@@ -265,6 +262,9 @@ export function describe(decision: LoopDecision): string {
       return (
         `repaid $${decision.repaidUsd.toFixed(2)} — ` +
         `hf ${decision.healthFactorBefore.toFixed(4)} -> ${decision.healthFactorAfter.toFixed(4)}` +
+        (decision.disputed
+          ? ' — DISPUTED: platform reported failure, chain confirms the repay'
+          : '') +
         (decision.explorerUrl ? ` — ${decision.explorerUrl}` : '')
       );
   }

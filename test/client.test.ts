@@ -104,7 +104,7 @@ test('execute throws when the read-back contradicts a reported success', async (
     (error: unknown) => {
       const err = error as VerificationError;
       assert.ok(err instanceof VerificationError);
-      assert.match(err.message, /read-back did not confirm/);
+      assert.match(err.message, /read-back does not confirm/);
       assert.match(err.message, /non-zero sDAI balance/);
       return true;
     },
@@ -285,21 +285,47 @@ test('the API key never appears in an error message', async () => {
 });
 
 
-// --------------------------------------------------- causation, not just state
-// Regression for a real false positive on 2026-09-09: a repay failed, an
-// unrelated workflow improved the position seconds later, and the read-back
-// passed. The agent reported a defence it had not performed.
+// ------------------------------------------------- status vs chain disagreement
+// Both cases below are real, from Base mainnet on 2026-09-09. KeeperHub
+// reported `failed` for two repays that landed on-chain:
+//   hr13f96q8lqf11d0ivwlr -> 0x6792fea2… 07:39:25
+//   0cawawqobfb68ujng3add -> 0x6fb59e90… 07:58:51
+// A client that trusts the status field retries and pays twice.
 
-test('a failed execution throws before the read-back can be satisfied by someone else', async () => {
-  let verifyReads = 0;
-  const { fetcher } = stubFetcher((path, body) => {
-    const isRead = (body as { simulateOnly?: boolean }) && path.includes('get-user-account-data');
-    if (isRead) {
-      verifyReads += 1;
-      // The position looks healthy — but not because of this call.
-      return { payload: { result: { healthFactor: '1350000000000000000' } } };
+test('a reported failure that the chain confirms is marked disputed, not thrown', async () => {
+  const { fetcher } = stubFetcher((path) => {
+    if (path.includes('read-state')) {
+      return { payload: { result: { healthFactor: '1347450091727486332' } } };
     }
-    return { payload: { executionId: 'exec_failed', status: 'failed' } };
+    return { payload: { executionId: '0cawawqobfb68ujng3add', status: 'failed' } };
+  });
+
+  const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
+
+  const result = await client.execute({
+    protocol: 'aave-v3',
+    action: 'repay',
+    args: {},
+    verify: {
+      protocol: 'aave-v3',
+      action: 'read-state',
+      args: {},
+      expect: (r) => BigInt((r as { healthFactor: string }).healthFactor) > 1_050_000_000_000_000_000n,
+      describe: 'health factor should be above the trigger after repaying',
+    },
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.disputed, true, 'the disagreement must be surfaced');
+  assert.equal(result.verified?.passed, true);
+});
+
+test('a reported failure the chain does NOT confirm still throws', async () => {
+  const { fetcher } = stubFetcher((path) => {
+    if (path.includes('read-state')) {
+      return { payload: { result: { healthFactor: '1040000000000000000' } } };
+    }
+    return { payload: { executionId: 'exec_really_failed', status: 'failed' } };
   });
 
   const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
@@ -311,29 +337,53 @@ test('a failed execution throws before the read-back can be satisfied by someone
       args: {},
       verify: {
         protocol: 'aave-v3',
-        action: 'get-user-account-data',
+        action: 'read-state',
         args: {},
-        expect: () => true, // would pass, which is exactly the danger
+        expect: (r) => BigInt((r as { healthFactor: string }).healthFactor) > 1_050_000_000_000_000_000n,
       },
     }),
-    (error: unknown) => {
-      const err = error as Error;
-      assert.match(err.message, /Skipping the read-back/);
-      assert.match(err.message, /did not cause/);
-      return true;
-    },
+    /read-back does not confirm the position changed/,
   );
-
-  assert.equal(verifyReads, 0, 'the read-back must not run after a failed execution');
 });
 
-test('a failed execution throws even with no verify spec', async () => {
+test('a success the chain does not confirm still throws', async () => {
+  const { fetcher } = stubFetcher((path) => {
+    if (path.includes('read-state')) {
+      return { payload: { result: { balance: '0' } } };
+    }
+    return { payload: { executionId: 'exec_liar', status: 'completed' } };
+  });
+
+  const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
+
+  await assert.rejects(
+    client.execute({
+      protocol: 'spark',
+      action: 'vault-deposit',
+      args: {},
+      verify: {
+        protocol: 'spark',
+        action: 'read-state',
+        args: {},
+        expect: (r) => BigInt((r as { balance: string }).balance) > 0n,
+      },
+    }),
+    /read-back does not confirm/,
+  );
+});
+
+test('a reported failure with no verify spec throws, but says not to assume', async () => {
   const { fetcher } = stubFetcher(() => ({
-    payload: { executionId: 'exec_failed_2', status: 'failed' },
+    payload: { executionId: 'exec_unverified', status: 'failed' },
   }));
   const client = new KeeperHubClient({ apiKey: 'k' }, fetcher);
   await assert.rejects(
     client.execute({ protocol: 'aave-v3', action: 'repay', args: {} }),
-    /KeeperHub reported failed for exec_failed_2/,
+    (error: unknown) => {
+      const err = error as Error;
+      assert.match(err.message, /Do not assume the write did not land/);
+      assert.match(err.message, /Fetch the receipt before retrying/);
+      return true;
+    },
   );
 });

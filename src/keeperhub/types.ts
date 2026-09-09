@@ -161,6 +161,13 @@ export interface ExecutionResult {
   };
   /** True when an idempotency key matched a previous execution. */
   deduplicated: boolean;
+  /**
+   * True when KeeperHub reported the execution as failed but the on-chain
+   * read-back confirms the state changed anyway. Observed on Base mainnet,
+   * 2026-09-09. When this is set, the chain has been treated as authoritative
+   * and the write must NOT be retried.
+   */
+  disputed?: boolean;
 }
 
 export interface ReadResult<T = unknown> {

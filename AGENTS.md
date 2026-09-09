@@ -47,11 +47,12 @@ wallet.
 
 ## Environment
 
+```
 KEEPERHUB_API_KEY=kh_...
 KEEPERHUB_EXECUTING_ADDRESS=0x... # from kh wallet info — NOT the agent wallet
 KEEPERHUB_CHAIN=base
 PORT=3077
-
+```
 
 KeeperHub signs from a Turnkey wallet that is not the agent's wallet, and an
 API key cannot read that address. It must be configured.

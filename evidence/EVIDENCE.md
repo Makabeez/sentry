@@ -113,6 +113,18 @@ The fix is [#2386](https://github.com/KeeperHub/keeperhub/pull/2386), opened by
 another contributor against the invariant the maintainer named. I am not
 touching it.
 
+Fixed in production, three days after the report
+
+null from the sponsorship wrapper now means only a definite pre-broadcast rejection: a gRPC refusal still returns null, any other send failure throws SponsoredTxPendingError, and the direct-signing fallback never runs (lib/web3/turnkey-sponsored-tx.ts:163-169). The status poll returns null only on a terminal-failure status — an error flag while the activity is still live throws pending instead. And a sponsored failure that does hold a hash now returns it (plugins/web3/steps/write-contract-core.ts:592-602).
+
+Shipped in KeeperHub v3.5.0, merged to production on 12 September 2026. The report was filed on 9 September.
+
+The maintainer also settled the breadth from the source tree rather than from further testing: every protocol write resolves to the same step (lib/protocol-registry.ts:527-529 → protocol-write → writeContractCore at plugins/protocol/steps/protocol-write.ts:395), and both entry points in lib/web3/sponsored-transaction-manager.ts funnel into submitTurnkeySponsoredTransaction. Native transfers, token transfers, approvals and every contract call share one send. There is no repay-shaped branch on that path, and no Aave-shaped one.
+
+I offered to reproduce the incident against a non-Aave protocol to establish the breadth. He declined it, correctly: the window needs an ethSendTransaction timeout or a status poll that flags an error while the activity is still live, and neither is reachable from the caller side. A sponsored write that completes normally reports completed and separates nothing. The offer would have spent capital to learn nothing.
+
+This does not retire the design decision below. The specific null-window is closed. The general property is not: an execution platform's status field is a claim about the chain, not the chain itself, and a version bump does not change which of the two is authoritative. Sentry still verifies, still marks disagreement disputed, and still refuses to retry an unresolved write.
+
 ### What Sentry does about it
 
 The on-chain read-back is the authority. The status field is a second opinion.
